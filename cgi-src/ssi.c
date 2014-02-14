@@ -215,6 +215,7 @@ check_filename( char* filename )
     {
     static int inited = 0;
     static char* cgi_pattern;
+    static char* pxy_pattern;
     int fnl;
     char* cp;
     char* dirname;
@@ -230,6 +231,12 @@ check_filename( char* filename )
 	if ( cgi_pattern == (char*) 0 )
 	    cgi_pattern = CGI_PATTERN;
 #endif /* CGI_PATTERN */
+	/* Get the pxy pattern. */
+	pxy_pattern = getenv( "PXY_PATTERN" );
+#ifdef PXY_PATTERN
+	if ( pxy_pattern == (char*) 0 )
+	    pxy_pattern = PXY_PATTERN;
+#endif /* PXY_PATTERN */
 	inited = 1;
 	}
 
@@ -270,8 +277,10 @@ check_filename( char* filename )
 	return 0;
 #endif /* AUTH_FILE */
 
-    /* Ensure that we are not reading a CGI file. */
+    /* Ensure that we are not reading a CGI or PXY file. */
     if ( cgi_pattern != (char*) 0 && match( cgi_pattern, filename ) )
+	return 0;
+    if ( pxy_pattern != (char*) 0 && match( pxy_pattern, filename ) )
 	return 0;
 
     return 1;

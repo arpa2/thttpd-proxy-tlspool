@@ -72,6 +72,8 @@ typedef struct {
     unsigned short port;
     char* cgi_pattern;
     int cgi_limit, cgi_count;
+    char* pxy_pattern;
+    int pxy_limit, pxy_count;
     char* charset;
     char* p3p;
     int max_age;
@@ -120,9 +122,10 @@ typedef struct {
     char* authorization;
     char* remoteuser;
     char* response;
+    char* origrequest;
     size_t maxdecodedurl, maxorigfilename, maxexpnfilename, maxencodings,
 	maxpathinfo, maxquery, maxaccept, maxaccepte, maxreqhost, maxhostdir,
-	maxremoteuser, maxresponse;
+	maxremoteuser, maxresponse, maxorigrequest;
 #ifdef TILDE_MAP_2
     char* altdir;
     size_t maxaltdir;
@@ -141,6 +144,8 @@ typedef struct {
     int should_linger;
     struct stat sb;
     int conn_fd;
+    int prox_fd;	/* if not -1, this connection is a proxy passthrough */
+    FILE *proxyconfig;	/* while not connected, this serves config lines */
     char* file_address;
     } httpd_conn;
 
@@ -171,7 +176,8 @@ typedef struct {
 */
 extern httpd_server* httpd_initialize(
     char* hostname, httpd_sockaddr* sa4P, httpd_sockaddr* sa6P,
-    unsigned short port, char* cgi_pattern, int cgi_limit, char* charset,
+    unsigned short port, char* cgi_pattern, int cgi_limit,
+    char* pxy_pattern, int pxy_limit, char* charset,
     char* p3p, int max_age, char* cwd, int no_log, FILE* logfp,
     int no_symlink_check, int vhost, int global_passwd, char* url_pattern,
     char* local_pattern, int no_empty_referers );
@@ -219,6 +225,13 @@ extern int httpd_got_request( httpd_conn* hc );
 */
 extern int httpd_parse_request( httpd_conn* hc );
 
+/* Unparse the parsed request in hc->read_buf.  A few places were set
+** to '\0' characters to fill variables in httpd_conn, but at some point
+** this may be reversed using this function.  The variables will then be
+** unusable.
+*/
+extern void httpd_unparse_request( httpd_conn* hc );
+
 /* Starts sending data back to the client.  In some cases (directories,
 ** CGI programs), finishes sending by itself - in those cases, hc->file_fd
 ** is <0.  If there is more data to be sent, then hc->file_fd is a file
@@ -245,6 +258,22 @@ extern void httpd_close_conn( httpd_conn* hc, struct timeval* nowP );
 extern void httpd_destroy_conn( httpd_conn* hc );
 
 
+/* This this to asynchronously try connecting to the next backend service.
+** This applies to hc->prox_fd, which will offer FDW_WRITE when connected
+** or otherwise engaged.  Trying another connect() then returns 0 on
+** success or an error on failure; in the latter case, yet another attempt
+** can be tried with this function.
+** Note that connection timeouts may be much longer than you care to wait
+** for before responding to the client.
+*/
+extern int webproxy_next( httpd_conn* hc );
+
+/* Once a connection to the backend has been created, or when a call to
+** webproxy_next() failed, call this function to stop trying to load entries
+** from the list in the configuration file.
+*/
+extern void webproxy_done( httpd_conn* hc );
+
 /* Send an error message back to the client. */
 extern void httpd_send_err(
     httpd_conn* hc, int status, char* title, char* extraheads, char* form, char* arg );
@@ -256,6 +285,8 @@ extern char* httpd_err408title;
 extern char* httpd_err408form;
 extern char* httpd_err503title;
 extern char* httpd_err503form;
+extern char* httpd_err504title;
+extern char* httpd_err504form;
 
 /* Generate a string representation of a method number. */
 extern char* httpd_method_str( int method );

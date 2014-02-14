@@ -172,6 +172,7 @@ static void post_post_garbage_hack( httpd_conn* hc );
 static void cgi_interpose_output( httpd_conn* hc, int rfd );
 static void cgi_child( httpd_conn* hc );
 static int cgi( httpd_conn* hc );
+static int webproxy_start( httpd_conn* hc );
 static int really_start_request( httpd_conn* hc, struct timeval* nowP );
 static void make_log_entry( httpd_conn* hc, struct timeval* nowP );
 static int check_referer( httpd_conn* hc );
@@ -214,6 +215,8 @@ free_httpd_server( httpd_server* hs )
 	free( (void*) hs->cwd );
     if ( hs->cgi_pattern != (char*) 0 )
 	free( (void*) hs->cgi_pattern );
+    if ( hs->pxy_pattern != (char*) 0 )
+	free( (void*) hs->pxy_pattern );
     if ( hs->charset != (char*) 0 )
 	free( (void*) hs->charset );
     if ( hs->p3p != (char*) 0 )
@@ -229,7 +232,8 @@ free_httpd_server( httpd_server* hs )
 httpd_server*
 httpd_initialize(
     char* hostname, httpd_sockaddr* sa4P, httpd_sockaddr* sa6P,
-    unsigned short port, char* cgi_pattern, int cgi_limit, char* charset,
+    unsigned short port, char* cgi_pattern, int cgi_limit,
+    char* pxy_pattern, int pxy_limit, char* charset,
     char* p3p, int max_age, char* cwd, int no_log, FILE* logfp,
     int no_symlink_check, int vhost, int global_passwd, char* url_pattern,
     char* local_pattern, int no_empty_referers )
@@ -296,8 +300,27 @@ httpd_initialize(
 	while ( ( cp = strstr( hs->cgi_pattern, "|/" ) ) != (char*) 0 )
 	    (void) strcpy( cp + 1, cp + 2 );
 	}
+    if ( pxy_pattern == (char*) 0 )
+	hs->pxy_pattern = (char*) 0;
+    else
+	{
+	/* Nuke any leading slashes. */
+	if ( pxy_pattern[0] == '/' )
+	    ++pxy_pattern;
+	hs->pxy_pattern = strdup( pxy_pattern );
+	if ( hs->pxy_pattern == (char*) 0 )
+	    {
+	    syslog( LOG_CRIT, "out of memory copying pxy_pattern" );
+	    return (httpd_server*) 0;
+	    }
+	/* Nuke any leading slashes in the cgi pattern. */
+	while ( ( cp = strstr( hs->pxy_pattern, "|/" ) ) != (char*) 0 )
+	    (void) strcpy( cp + 1, cp + 2 );
+	}
     hs->cgi_limit = cgi_limit;
     hs->cgi_count = 0;
+    hs->pxy_limit = pxy_limit;
+    hs->pxy_count = 0;
     hs->charset = strdup( charset );
     hs->p3p = strdup( p3p );
     hs->max_age = max_age;
@@ -543,6 +566,10 @@ static char* err501form =
 char* httpd_err503title = "Service Temporarily Overloaded";
 char* httpd_err503form =
     "The requested URL '%.80s' is temporarily overloaded.  Please try again later.\n";
+
+char* httpd_err504title = "Gateway Timeout";
+char* httpd_err504form =
+    "The requested URL '%.80s' requires a backend service which is currently unresponsive.  Please try again later.\n";
 
 
 /* Append a string to the buffer waiting to be sent as response. */
@@ -1668,10 +1695,11 @@ httpd_get_conn( httpd_server* hs, int listen_fd, httpd_conn* hc )
 	    hc->maxorigfilename = hc->maxexpnfilename = hc->maxencodings =
 	    hc->maxpathinfo = hc->maxquery = hc->maxaccept =
 	    hc->maxaccepte = hc->maxreqhost = hc->maxhostdir =
-	    hc->maxremoteuser = hc->maxresponse = 0;
+	    hc->maxremoteuser = hc->maxresponse = hc->maxorigrequest = 0;
 #ifdef TILDE_MAP_2
 	hc->maxaltdir = 0;
 #endif /* TILDE_MAP_2 */
+	hc->prox_fd = -1;
 	httpd_realloc_str( &hc->decodedurl, &hc->maxdecodedurl, 1 );
 	httpd_realloc_str( &hc->origfilename, &hc->maxorigfilename, 1 );
 	httpd_realloc_str( &hc->expnfilename, &hc->maxexpnfilename, 0 );
@@ -1684,9 +1712,11 @@ httpd_get_conn( httpd_server* hs, int listen_fd, httpd_conn* hc )
 	httpd_realloc_str( &hc->hostdir, &hc->maxhostdir, 0 );
 	httpd_realloc_str( &hc->remoteuser, &hc->maxremoteuser, 0 );
 	httpd_realloc_str( &hc->response, &hc->maxresponse, 0 );
+	httpd_realloc_str( &hc->origrequest, &hc->maxorigrequest, 0 );
 #ifdef TILDE_MAP_2
 	httpd_realloc_str( &hc->altdir, &hc->maxaltdir, 0 );
 #endif /* TILDE_MAP_2 */
+	hc->proxyconfig = NULL;
 	hc->initialized = 1;
 	}
 
@@ -1941,6 +1971,13 @@ httpd_parse_request( httpd_conn* hc )
     char* cp;
     char* pi;
 
+    /* Before modifying the request, clone it in binary mode.
+    ** This helps to recover the request when proxying. */
+    if ( hc->hs->pxy_pattern )
+	{
+	httpd_realloc_str( &hc->origrequest, &hc->maxorigrequest, hc->read_idx );
+	memcpy( hc->origrequest, hc->read_buf, hc->read_idx );
+	}
     hc->checked_idx = 0;	/* reset */
     method_str = bufgets( hc );
     url = strpbrk( method_str, " \t\012\015" );
@@ -2069,7 +2106,7 @@ httpd_parse_request( httpd_conn* hc )
 		cp += strspn( cp, " \t" );
 		hc->useragent = cp;
 		}
-	    else if ( strncasecmp( buf, "Host:", 5 ) == 0 )
+	    else if ( ( strncasecmp( buf, "Host:", 5 ) == 0 ) && ( hc->hdrhost[0] == '\0' ) )
 		{
 		cp = &buf[5];
 		cp += strspn( cp, " \t" );
@@ -2148,7 +2185,7 @@ httpd_parse_request( httpd_conn* hc )
 		cp += strspn( cp, " \t" );
 		hc->cookie = cp;
 		}
-	    else if ( strncasecmp( buf, "Range:", 6 ) == 0 )
+	    else if ( ( strncasecmp( buf, "Range:", 6 ) == 0 ) && ( ! hc->got_range ) )
 		{
 		/* Only support %d- and %d-%d, not %d-%d,%d-%d or -%d. */
 		if ( strchr( buf, ',' ) == (char*) 0 )
@@ -2447,6 +2484,11 @@ httpd_close_conn( httpd_conn* hc, struct timeval* nowP )
 	{
 	(void) close( hc->conn_fd );
 	hc->conn_fd = -1;
+	}
+    if ( hc->prox_fd >= 0 )
+	{
+	(void) close( hc->prox_fd );
+	hc->prox_fd = -1;
 	}
     }
 
@@ -3079,6 +3121,7 @@ make_envp( httpd_conn* hc )
     if ( getenv( "TZ" ) != (char*) 0 )
 	envp[envn++] = build_env( "TZ=%s", getenv( "TZ" ) );
     envp[envn++] = build_env( "CGI_PATTERN=%s", hc->hs->cgi_pattern );
+    envp[envn++] = build_env( "PXY_PATTERN=%s", hc->hs->pxy_pattern );
 
     envp[envn] = (char*) 0;
     return envp;
@@ -3295,6 +3338,7 @@ cgi_interpose_output( httpd_conn* hc, int rfd )
 	case 500: title = err500title; break;
 	case 501: title = err501title; break;
 	case 503: title = httpd_err503title; break;
+	case 504: title = httpd_err504title; break;
 	default: title = "Something"; break;
 	}
     (void) my_snprintf( buf, sizeof(buf), "HTTP/1.0 %d %s\015\012", status, title );
@@ -3582,12 +3626,144 @@ cgi( httpd_conn* hc )
     }
 
 
+void webproxy_done( httpd_conn* hc )
+    {
+    if ( hc->proxyconfig != NULL )
+	{
+	fclose( hc->proxyconfig );
+	hc->proxyconfig = NULL;
+	}
+    if ( hc->prox_fd != -1 )
+	{
+	close( hc->prox_fd );
+	hc->prox_fd = -1;
+	}
+    }
+
+int webproxy_next( httpd_conn* hc )
+    {
+    char buf[1000];
+    int flags;
+
+    if ( hc->proxyconfig == NULL )
+	return -1;
+    if ( hc->prox_fd != -1 )
+	{
+	close( hc->prox_fd );
+	hc->prox_fd = -1;
+	}
+    while( hc->prox_fd == -1 )
+	{
+	/* Iterate over lines until one succeeds to connect a TCP socket */
+	int sox;
+	char* spc;
+	unsigned long port;
+	struct sockaddr_in6 sa;
+	if ( fgets( buf, sizeof(buf), hc->proxyconfig ) == NULL )
+	    break;	/* end of file or error */
+	if ( memcmp ( buf, "http ", 5 ) != 0 )
+	    continue;	/* not the right kind of proxy line */
+	spc = strchr( &(buf[5]), ' ' );
+	if ( spc == NULL )
+	    continue;	/* no separator between host and port */
+	if ( strrchr( buf, ' ' ) != spc )
+	    continue;	/* more than two spaces on this line */
+	*spc++ = '\0';
+	port = strtoul (spc, &spc, 10);
+	if ( ( port == 0 ) || ( port > 65535 ) )
+	    continue;	/* illegal port number */
+	if ( *spc != '\n' )
+	    continue;	/* Trailing info after port number */
+	memset ( &sa, 0, sizeof( sa ) );
+	sa.sin6_family = AF_INET6;
+	sa.sin6_port = htons( port );
+	if ( inet_pton( AF_INET6, &(buf[5]), &sa.sin6_addr ) == -1 )
+	    continue;	/* Failing address parser */
+	/* Attempt to connect a TCP socket to the backend address:port */
+	sox = socket( AF_INET6, SOCK_STREAM, 0 );
+	if ( sox == -1 )
+	    continue;
+        /* Set the listen file descriptor to no-delay / non-blocking mode. */
+        flags = fcntl( sox, F_GETFL, 0 );
+        if ( flags == -1 )
+	    {
+	    syslog( LOG_CRIT, "fcntl F_GETFL - %m" );
+	    (void) close( sox );
+	    continue;
+	    }
+        if ( fcntl( sox, F_SETFL, flags | O_NDELAY ) < 0 )
+	    {
+	    syslog( LOG_CRIT, "fcntl O_NDELAY - %m" );
+	    (void) close( sox );
+	    continue;
+	    }
+	/* Now setup an _asynchronous_ connect, meaning that it will not
+	** return 0 for okay, but -1 with errno == EINPROGRESS.  The
+	** connect() can be retried until it returns 0, and the best time
+	** is after the socket is cleared for writing.  The main program
+	** will keep the connection in CNST_CONNECTING until the connect()
+	** call succeeds; it may even attempt alternative connections
+	** while at it.
+	*/
+	switch ( connect (sox, (struct sockaddr*) &sa, sizeof (sa) ) )
+	    {
+	    default:
+	        close( sox );
+		continue;
+	    case -1:
+		if ( errno != EINPROGRESS )
+		    {
+		    close ( sox );
+		    continue;
+		    }
+		// Continue into case 0 for "ok" handling
+	    case 0:
+		hc->prox_fd = sox;
+		break;
+	    }
+	}
+    if ( feof( hc->proxyconfig ) )
+	webproxy_done( hc );
+    return ( hc->prox_fd == -1 ) ? -1 : 0;
+    }
+
+static int
+webproxy_start( httpd_conn* hc )
+    {
+    /* Load the proxy file, parse the forwarding line(s) and return the
+    ** first connection that succeeds in hc->prox_fd.  Further webproxy
+    ** behaviour is handled through modifications in the thttpd code.
+    **/
+    hc->proxyconfig = fopen( hc->expnfilename, "r" );
+    if ( hc->proxyconfig == NULL )
+	return -1;
+
+    /* Recover the original query -- this makes some of the variables in
+    ** httpd_conn* hc unterminated strings, but we won't need them anymore.
+    **/
+    memcpy( hc->read_buf, hc->origrequest, hc->read_idx );
+
+    /* The first line of proxyconfig is read as though it were the next,
+    ** and a first tentative connection is setup, asynchronously.
+    **/
+    if (webproxy_next( hc ) == -1)
+	{
+	webproxy_done( hc );
+	return -1;
+	}
+    return 0;
+
+    }
+
+
 static int
 really_start_request( httpd_conn* hc, struct timeval* nowP )
     {
     static char* indexname;
     static size_t maxindexname = 0;
-    static const char* index_names[] = { INDEX_NAMES };
+    static const char* index_names[] = { INDEX_NAMES, NULL };
+    static const char* proxy_names[] = { PROXY_NAMES, NULL };
+    char **iter_names;
     int i;
 #ifdef AUTH_FILE
     static char* dirname;
@@ -3596,11 +3772,56 @@ really_start_request( httpd_conn* hc, struct timeval* nowP )
     size_t expnlen, indxlen;
     char* cp;
     char* pi;
+    int proxied = 0;
 
     expnlen = strlen( hc->expnfilename );
 
+    /* Decide whether we are serving as a proxy to a backend. */
+    httpd_realloc_str( &indexname, &maxindexname,
+		expnlen + 1 + strlen( hc->pathinfo ) );
+    strcpy( indexname, hc->expnfilename );
+    if ( hc->pathinfo[0] != '\0' )
+	{
+	indexname[expnlen] = '/';
+	strcpy( &(indexname[expnlen+1]), hc->pathinfo );
+	}
+    if ( ( hc->hs->pxy_pattern != NULL )
+		&& match( hc->hs->pxy_pattern, indexname ) )
+	proxied = 1;
+
+#if 0
+    /* Stat the file. */
+    if ( stat( hc->expnfilename, &hc->sb ) < 0 )
+	{
+	/* Non-present files/directories may fall back to the proxy pattern */
+	int traillen;
+
+	if ( ( hc->hs->pxy_pattern != (char*) 0 ) &&
+		match( hc->hs->pxy_pattern, hc->expnfilename, &traillen ) )
+	    {
+	    int wild = expnlen - traillen;
+	    int newlen = strlen( hc->expnfilename ) - traillen + 10;
+	    httpd_realloc_str( &hc->expnfilename, &hc->maxexpnfilename, newlen );
+	    if ( ( wild > 0 ) && ( hc->expnfilename [wild-1] == '/' ) )
+		hc->expnfilename [wild++] = '/';
+	    strcpy( &(hc->expnfilename[wild]), "index.pxy" );
+	    expnlen = wild + 9;
+	    if ( ( stat( hc->expnfilename, &hc->sb ) >= 0 ) &&
+			( hc->sb.st_uid == 0 ) &&
+			( ( hc->sb.st_mode & ( S_IXGRP | S_IWGRP | S_IXOTH | S_IWOTH | S_IXUSR ) ) == 0 ) )
+		proxied = 1;
+	    }
+	if ( ! proxied )
+	    {
+	    httpd_send_err( hc, 500, err500title, "", err500form, hc->encodedurl );
+	    return -1;
+	    }
+        }
+#endif
+
+    /* Methods are filtered only for locally resolved files */
     if ( hc->method != METHOD_GET && hc->method != METHOD_HEAD &&
-	 hc->method != METHOD_POST )
+	 hc->method != METHOD_POST && ! proxied )
 	{
 	httpd_send_err(
 	    hc, 501, err501title, "", err501form, httpd_method_str( hc->method ) );
@@ -3635,8 +3856,8 @@ really_start_request( httpd_conn* hc, struct timeval* nowP )
     /* Is it a directory? */
     if ( S_ISDIR(hc->sb.st_mode) )
 	{
-	/* If there's pathinfo, it's just a non-existent file. */
-	if ( hc->pathinfo[0] != '\0' )
+	/* If there's pathinfo, it's a non-existent file or a proxied one. */
+	if ( ( hc->pathinfo[0] != '\0' ) && ( ! proxied ) )
 	    {
 	    httpd_send_err( hc, 404, err404title, "", err404form, hc->encodedurl );
 	    return -1;
@@ -3648,25 +3869,27 @@ really_start_request( httpd_conn* hc, struct timeval* nowP )
 	*/
 	if ( strcmp( hc->origfilename, "" ) != 0 &&
 	     strcmp( hc->origfilename, "." ) != 0 &&
-	     hc->origfilename[strlen( hc->origfilename ) - 1] != '/' )
+	     hc->origfilename[strlen( hc->origfilename ) - 1] != '/' &&
+	     ( ! proxied ) )
 	    {
 	    send_dirredirect( hc );
 	    return -1;
 	    }
 
 	/* Check for an index file. */
-	for ( i = 0; i < sizeof(index_names) / sizeof(char*); ++i )
+	iter_names = proxied? &(proxy_names[0]): &(index_names[0]);
+	for ( i = 0; iter_names[i]; ++i )
 	    {
 	    httpd_realloc_str(
 		&indexname, &maxindexname,
-		expnlen + 1 + strlen( index_names[i] ) );
+		expnlen + 1 + strlen( iter_names[i] ) );
 	    (void) strcpy( indexname, hc->expnfilename );
 	    indxlen = strlen( indexname );
 	    if ( indxlen == 0 || indexname[indxlen - 1] != '/' )
 		(void) strcat( indexname, "/" );
 	    if ( strcmp( indexname, "./" ) == 0 )
 		indexname[0] = '\0';
-	    (void) strcat( indexname, index_names[i] );
+	    (void) strcat( indexname, iter_names[i] );
 	    if ( stat( indexname, &hc->sb ) >= 0 )
 		goto got_one;
 	    }
@@ -3784,14 +4007,31 @@ really_start_request( httpd_conn* hc, struct timeval* nowP )
     if ( ! check_referer( hc ) )
 	return -1;
 
+    /* Is it proxied, root owned and go-w and ugo-x? */
+    if ( proxied )
+	if ( ( hc->sb.st_uid == 0 ) &&
+		( ( hc->sb.st_mode & ( S_IXGRP | S_IWGRP | S_IXOTH | S_IWOTH | S_IXUSR ) ) == 0 ) )
+	    return webproxy_start( hc );
+	else
+	    {
+	    syslog(
+		LOG_NOTICE,
+		"%.80s URL \"%.80s\" tried to use an improper proxy file; it must be root-owned, and setup with access go-w and ugo-x",
+		httpd_ntoa( &hc->client_addr ), hc->encodedurl );
+	    httpd_send_err(
+		hc, 403, err403title, "",
+		ERROR_FORM( err403form, "The requested URL '%.80s' is an unproperly configured proxy description.  Please see log files for details.\n" ),
+		hc->encodedurl );
+	    }
+
     /* Is it world-executable and in the CGI area? */
-    if ( hc->hs->cgi_pattern != (char*) 0 &&
+    if ( ( hc->hs->cgi_pattern != (char*) 0 ) &&
 	 ( hc->sb.st_mode & S_IXOTH ) &&
 	 match( hc->hs->cgi_pattern, hc->expnfilename ) )
 	return cgi( hc );
 
-    /* It's not CGI.  If it's executable or there's pathinfo, someone's
-    ** trying to either serve or run a non-CGI file as CGI.   Either case
+    /* It's not anything special.  If it's executable or there's pathinfo,
+    ** someone's trying to either serve or run a special file.   Either case
     ** is prohibited.
     */
     if ( hc->sb.st_mode & S_IXOTH )

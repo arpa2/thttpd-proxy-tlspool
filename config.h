@@ -335,6 +335,11 @@
 */
 #define INDEX_NAMES "index.html", "index.htm", "index.xhtml", "index.xht", "Default.htm", "index.cgi"
 
+/* CONFIGURE: A list of proxy index names to check.  The files are searched
+** for in this order, mostly like the INDEX_FILES but for proxy operation.
+*/
+#define PROXY_NAMES "index.proxy", "index.pxy", "index.txt"
+
 /* CONFIGURE: If this is defined then thttpd will automatically generate
 ** index pages for directories that don't have an explicit index file.
 ** If you want to disable this behavior site-wide, perhaps for security

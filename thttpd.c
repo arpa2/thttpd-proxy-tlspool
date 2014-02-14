@@ -77,6 +77,8 @@ static char* data_dir;
 static int do_chroot, no_log, no_symlink_check, do_vhost, do_global_passwd;
 static char* cgi_pattern;
 static int cgi_limit;
+static char* pxy_pattern;
+static int pxy_limit;
 static char* url_pattern;
 static int no_empty_referers;
 static char* local_pattern;
@@ -128,6 +130,7 @@ static int httpd_conn_count;
 #define CNST_SENDING 2
 #define CNST_PAUSING 3
 #define CNST_LINGERING 4
+#define CNST_CONNECTING 5
 
 
 static httpd_server* hs = (httpd_server*) 0;
@@ -153,6 +156,9 @@ static void shut_down( void );
 static int handle_newconnect( struct timeval* tvP, int listen_fd );
 static void handle_read( connecttab* c, struct timeval* tvP );
 static void handle_send( connecttab* c, struct timeval* tvP );
+static void handle_connect( connecttab* c, struct timeval* tvP );
+static void handle_read_proxy( connecttab* c, struct timeval* tvP );
+static void handle_send_proxy( connecttab* c, struct timeval* tvP );
 static void handle_linger( connecttab* c, struct timeval* tvP );
 static int check_throttles( connecttab* c );
 static void clear_throttles( connecttab* c, struct timeval* tvP );
@@ -640,7 +646,7 @@ main( int argc, char** argv )
     hs = httpd_initialize(
 	hostname,
 	gotv4 ? &sa4 : (httpd_sockaddr*) 0, gotv6 ? &sa6 : (httpd_sockaddr*) 0,
-	port, cgi_pattern, cgi_limit, charset, p3p, max_age, cwd, no_log, logfp,
+	port, cgi_pattern, cgi_limit, pxy_pattern, pxy_limit, charset, p3p, max_age, cwd, no_log, logfp,
 	no_symlink_check, do_vhost, do_global_passwd, url_pattern,
 	local_pattern, no_empty_referers );
     if ( hs == (httpd_server*) 0 )
@@ -798,16 +804,32 @@ main( int argc, char** argv )
 	    if ( c == (connecttab*) 0 )
 		continue;
 	    hc = c->hc;
-	    if ( ! fdwatch_check_fd( hc->conn_fd ) )
+	    if ( ( ! fdwatch_check_fd( hc->conn_fd ) ) && ( ! fdwatch_check_fd( hc->prox_fd ) ) )
+		{
 		/* Something went wrong. */
 		clear_connection( c, &tv );
+		}
+	    else if ( hc->prox_fd != -1 )
+		{
+		/* Proxy mode between conn_fd and prox_fd, with work to do */
+		switch ( c->conn_state )
+		     {
+		     case CNST_CONNECTING: handle_connect( c, &tv ); break;
+		     case CNST_READING: handle_read_proxy( c, &tv ); break;
+		     case CNST_SENDING: handle_send_proxy( c, &tv ); break;
+		     case CNST_LINGERING: handle_linger( c, &tv ); break;
+		     }
+		}
 	    else
+		{
+		/* Plain connection handling, with work to do */
 		switch ( c->conn_state )
 		    {
 		    case CNST_READING: handle_read( c, &tv ); break;
 		    case CNST_SENDING: handle_send( c, &tv ); break;
 		    case CNST_LINGERING: handle_linger( c, &tv ); break;
 		    }
+		}
 	    }
 	tmr_run( &tv );
 
@@ -869,6 +891,16 @@ parse_args( int argc, char** argv )
 #else /* CGI_LIMIT */
     cgi_limit = 0;
 #endif /* CGI_LIMIT */
+#ifdef PXY_PATTERN
+    pxy_pattern = PXY_PATTERN;
+#else /* PXY_PATTERN */
+    pxy_pattern = (char*) 0;
+#endif /* PXY_PATTERN */
+#ifdef PXY_LIMIT
+    pxy_limit = PXY_LIMIT;
+#else /* PXY_LIMIT */
+    pxy_limit = 0;
+#endif /* PXY_LIMIT */
     url_pattern = (char*) 0;
     no_empty_referers = 0;
     local_pattern = (char*) 0;
@@ -932,6 +964,11 @@ parse_args( int argc, char** argv )
 	    ++argn;
 	    cgi_pattern = argv[argn];
 	    }
+	else if ( strcmp( argv[argn], "-x" ) == 0 && argn + 1 < argc )
+	    {
+	    ++argn;
+	    pxy_pattern = argv[argn];
+	    }
 	else if ( strcmp( argv[argn], "-t" ) == 0 && argn + 1 < argc )
 	    {
 	    ++argn;
@@ -990,7 +1027,7 @@ static void
 usage( void )
     {
     (void) fprintf( stderr,
-"usage:  %s [-C configfile] [-p port] [-d dir] [-r|-nor] [-dd data_dir] [-s|-nos] [-v|-nov] [-g|-nog] [-u user] [-c cgipat] [-t throttles] [-h host] [-l logfile] [-i pidfile] [-T charset] [-P P3P] [-M maxage] [-V] [-D]\n",
+"usage:  %s [-C configfile] [-p port] [-d dir] [-r|-nor] [-dd data_dir] [-s|-nos] [-v|-nov] [-g|-nog] [-u user] [-c cgipat] [-x pxypat] [-t throttles] [-h host] [-l logfile] [-i pidfile] [-T charset] [-P P3P] [-M maxage] [-V] [-D]\n",
 	argv0 );
     exit( 1 );
     }
@@ -1099,10 +1136,20 @@ read_config( char* filename )
 		value_required( name, value );
 		cgi_pattern = e_strdup( value );
 		}
+	    else if ( strcasecmp( name, "pxypat" ) == 0 )
+		{
+		value_required( name, value );
+		pxy_pattern = e_strdup( value );
+		}
 	    else if ( strcasecmp( name, "cgilimit" ) == 0 )
 		{
 		value_required( name, value );
 		cgi_limit = atoi( value );
+		}
+	    else if ( strcasecmp( name, "pxylimit" ) == 0 )
+		{
+		value_required( name, value );
+		pxy_limit = atoi( value );
 		}
 	    else if ( strcasecmp( name, "urlpat" ) == 0 )
 		{
@@ -1664,6 +1711,21 @@ handle_read( connecttab* c, struct timeval* tvP )
 	return;
 	}
 
+    /* If this is a proxy, get ready to relay the request. */
+    if ( hc->prox_fd != -1 )
+	{
+	/* The checked_idx will be reused as a write index in the read_buf, 
+	 * and the connection will be considered as one that has data to
+	 * send, with an option to "resume" the normal mode of reading from
+	 * either end when the send is complete.
+	 */
+	hc->checked_idx = 0;
+	fdwatch_del_fd( hc->conn_fd );
+	fdwatch_add_fd( hc->prox_fd, c, FDW_WRITE );
+	c->conn_state = CNST_CONNECTING; /* Connection triggers FDW_WRITE */
+	return;
+	}
+
     /* Fill in end_byte_index. */
     if ( hc->got_range )
 	{
@@ -1861,17 +1923,203 @@ handle_send( connecttab* c, struct timeval* tvP )
     /* (No check on min_limit here, that only controls connection startups.) */
     }
 
+/* Proxy backend connections are setup asynchronously.  This function is
+ * normally called when asynchronous connect() completes, which triggers
+ * FDW_WRITE.  A repeated call to connect() then returns success or failure.
+ * In case of failure, another entry in the configuration file may be tried.
+ */
+static void
+handle_connect( connecttab* c, struct timeval* tvP )
+    {
+    httpd_conn* hc = c->hc;
+    int fail = 0;
+    struct sockaddr_in6 sin6;
+    socklen_t sin6len = sizeof( sin6 );
+    // A list of async-connect checks is on http://cr.yp.to/docs/connect.html
+    fail = ( getpeername( hc->prox_fd, (struct sockaddr*) &sin6, &sin6len ) == -1 ) && ( errno == ENOTCONN );
+    if ( ! fail )
+	{
+	/* Sending should work if the connection was setup properly */
+	handle_send_proxy( c, tvP );	/* Switches to read/read on success */
+	fail = c->conn_state != CNST_READING;
+	}
+    if ( fail )
+	{
+	fdwatch_del_fd( hc->prox_fd );
+	fail = ( webproxy_next( hc ) == -1 );
+	if ( ! fail)
+	    fdwatch_add_fd( hc->prox_fd, c, FDW_WRITE );
+	}
+    if ( fail )
+	{
+	/* This connection failed, and there are no more backends to try */
+	webproxy_done( hc );
+	syslog( LOG_INFO,
+		"%.80s gateway timeout while connecting to proxy",
+		httpd_ntoa( &c->hc->client_addr ) );
+	httpd_send_err(
+		c->hc, 504, httpd_err504title, "", httpd_err504form, "" );
+	finish_connection( c, tvP );
+	}
+    /* When failed, things have been cleaned up.  Otherwise, a new
+     * asynchronous connect() has been launched, and should return here.
+     */
+    }
+
+/* Proxy reading is normally possible on both c->hc->conn_fd and c->hc->prox_fd
+ * and when something comes in, it will be forwarded to the other side.  Only
+ * when the other side is blocking the write, will further actions be suspended
+ * until writing of the buffer is re-enabled.
+ */
+static void
+handle_read_proxy( connecttab* c, struct timeval* tvP )
+    {
+    int sz;
+    httpd_conn* hc = c->hc;
+    int rdside = -1, wrside = -1;
+
+    /* Ensure at least a 4 kB buffer for in hc->read_buf */
+    if ( hc->read_size < 4096 )
+	{
+	     httpd_realloc_str(
+	         &hc->read_buf, &hc->read_size, 4096 );
+	}
+    hc->read_idx = 0;
+
+    /* Determine communication direction */
+    if ( fdwatch_check_fd ( hc->prox_fd ) )
+	{
+	rdside = hc->prox_fd;
+	wrside = hc->conn_fd;
+	}
+    else if ( fdwatch_check_fd ( hc->conn_fd ) )
+	{
+	rdside = hc->conn_fd;
+	wrside = hc->prox_fd;
+	}
+    else
+	{
+	clear_connection( c, tvP );
+	return;
+	}
+
+    /* Read a bit of data */
+    sz = read(
+	rdside, &(hc->read_buf[hc->read_idx]),
+	hc->read_size - hc->read_idx );
+    
+    if ( sz == 0 )
+	{
+	finish_connection( c, tvP );
+	return;
+	}
+    if ( sz < 0 )
+	{
+	/* Ignore EINTR and EAGAIN.  Also ignore EWOULDBLOCK.  At first glance
+	** you would think that connections returned by fdwatch as readable
+	** should never give an EWOULDBLOCK; however, this apparently can
+	** happen if a packet gets garbled.
+	*/
+	if ( errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK )
+	    return;
+	finish_connection( c, tvP );
+	return;
+	}
+    hc->read_idx += sz;
+
+    /* Forward the data, and return if it succeeds */
+    sz = write( wrside, hc->read_buf, hc->read_idx );
+    if ( sz < hc->read_idx )
+	{
+	    if ( sz < 0 )
+		return;
+	    /* Not all was written.  Switch to only sending on wrside. */
+	    hc->checked_idx = sz;  // Re-use existing field that is now useless
+	    fdwatch_del_fd( rdside );
+	    fdwatch_del_fd( wrside );
+	    fdwatch_add_fd( wrside, c, FDW_WRITE );
+	    c->conn_state = CNST_SENDING;
+	    //TODO// Place a timeout on the remote's data acceptance?
+	    return;
+	}
+
+    /* Done.  Next read is welcome from either side. */
+    return;
+    }
+
+/* Proxy sending is only triggered in the exceptional situation where a
+ * prior send was refused.  During this time, the write-rejecting side is
+ * awaiting the write and the opposite side is no longer taking in reads.
+ * If we now succeed to send the last bit of pending data, it is possible
+ * to return both sides to reading.
+ *
+ * This function is also called to submit the first fragment to a backend
+ * server.  In this case, the c->conn_state is still set to CNST_CONNECTING
+ * and the success of this function (determined by c->conn_state being set
+ * to CNST_READING) determines whether another backend server must be
+ * tried.  This will not usually happen; getpeername() should have failed
+ * at an earlier stage and avoid even trying to send the data.
+ */
+static void
+handle_send_proxy( connecttab* c, struct timeval* tvP )
+    {
+    int sz;
+    httpd_conn* hc = c->hc;
+    int rdside = -1, wrside = -1;
+
+    /* Determine communication direction */
+    if ( fdwatch_check_fd ( hc->prox_fd ) )
+	{
+	wrside = hc->prox_fd;
+	rdside = hc->conn_fd;
+	}
+    else if ( fdwatch_check_fd ( hc->conn_fd ) )
+	{
+	wrside = hc->conn_fd;
+	rdside = hc->prox_fd;
+	}
+    else
+	{
+	clear_connection( c, tvP );
+	return;
+	}
+
+    /* Continue a write that was not (fully) successful. */
+    sz = hc->read_idx - hc->checked_idx;
+    sz = write( wrside, &(hc->read_buf [hc->checked_idx]), sz );
+    if ( sz >= 0 )
+	{
+	hc->checked_idx += sz;
+        if ( hc->checked_idx >= hc->read_idx )
+	    {
+	    /* All was written.  Switch back to reading on both sides. */
+	    fdwatch_del_fd( wrside );
+	    fdwatch_add_fd( wrside, c, FDW_READ );
+	    fdwatch_add_fd( rdside, c, FDW_READ );
+	    c->conn_state = CNST_READING;
+	    return;
+	    }
+	}
+    }
+
 
 static void
 handle_linger( connecttab* c, struct timeval* tvP )
     {
     char buf[4096];
     int r;
+    int fd;
+
+    /* Determine the fd that offers something to read */
+    if ( fdwatch_check_fd ( c->hc->conn_fd ) )
+	fd = c->hc->conn_fd;
+    else
+	fd = c->hc->prox_fd;
 
     /* In lingering-close mode we just read and ignore bytes.  An error
     ** or EOF ends things, otherwise we go until a timeout.
     */
-    r = read( c->hc->conn_fd, buf, sizeof(buf) );
+    r = read( fd, buf, sizeof(buf) );
     if ( r < 0 && ( errno == EINTR || errno == EAGAIN ) )
 	return;
     if ( r <= 0 )
@@ -2024,7 +2272,11 @@ clear_connection( connecttab* c, struct timeval* tvP )
     if ( c->hc->should_linger )
 	{
 	if ( c->conn_state != CNST_PAUSING )
+	    {
 	    fdwatch_del_fd( c->hc->conn_fd );
+	    if ( c->hc->prox_fd != -1 )
+		fdwatch_del_fd( c->hc->prox_fd );
+	    }
 	c->conn_state = CNST_LINGERING;
 	shutdown( c->hc->conn_fd, SHUT_WR );
 	fdwatch_add_fd( c->hc->conn_fd, c, FDW_READ );
@@ -2049,7 +2301,11 @@ really_clear_connection( connecttab* c, struct timeval* tvP )
     {
     stats_bytes += c->hc->bytes_sent;
     if ( c->conn_state != CNST_PAUSING )
+	{
 	fdwatch_del_fd( c->hc->conn_fd );
+	if ( c->hc->prox_fd != -1 )
+	    fdwatch_del_fd( c->hc->prox_fd );
+	}
     httpd_close_conn( c->hc, tvP );
     clear_throttles( c, tvP );
     if ( c->linger_timer != (Timer*) 0 )
