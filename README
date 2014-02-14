@@ -1,5 +1,6 @@
              thttpd - tiny/turbo/throttling HTTP server
                     version 2.25b of 29dec2003
+		enhanced with ARPA2.NET extensions
 
 thttpd is a simple, small, portable, fast, and secure HTTP server.
 
