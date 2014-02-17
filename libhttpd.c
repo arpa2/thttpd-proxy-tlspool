@@ -3359,7 +3359,10 @@ cgi_child( httpd_conn* hc )
 	{
 	int newfd = dup2( hc->conn_fd, STDERR_FILENO + 1 );
 	if ( newfd >= 0 )
+	    {
+	    close( hc->conn_fd );
 	    hc->conn_fd = newfd;
+	    }
 	/* If the dup2 fails, shrug.  We'll just take our chances.
 	** Shouldn't happen though.
 	*/
