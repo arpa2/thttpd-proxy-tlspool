@@ -3786,36 +3786,6 @@ really_start_request( httpd_conn* hc, struct timeval* nowP )
 		&& match( hc->hs->pxy_pattern, indexname ) )
 	proxied = 1;
 
-#if 0
-    /* Stat the file. */
-    if ( stat( hc->expnfilename, &hc->sb ) < 0 )
-	{
-	/* Non-present files/directories may fall back to the proxy pattern */
-	int traillen;
-
-	if ( ( hc->hs->pxy_pattern != (char*) 0 ) &&
-		match( hc->hs->pxy_pattern, hc->expnfilename, &traillen ) )
-	    {
-	    int wild = expnlen - traillen;
-	    int newlen = strlen( hc->expnfilename ) - traillen + 10;
-	    httpd_realloc_str( &hc->expnfilename, &hc->maxexpnfilename, newlen );
-	    if ( ( wild > 0 ) && ( hc->expnfilename [wild-1] == '/' ) )
-		hc->expnfilename [wild++] = '/';
-	    strcpy( &(hc->expnfilename[wild]), "index.pxy" );
-	    expnlen = wild + 9;
-	    if ( ( stat( hc->expnfilename, &hc->sb ) >= 0 ) &&
-			( hc->sb.st_uid == 0 ) &&
-			( ( hc->sb.st_mode & ( S_IXGRP | S_IWGRP | S_IXOTH | S_IWOTH | S_IXUSR ) ) == 0 ) )
-		proxied = 1;
-	    }
-	if ( ! proxied )
-	    {
-	    httpd_send_err( hc, 500, err500title, "", err500form, hc->encodedurl );
-	    return -1;
-	    }
-        }
-#endif
-
     /* Methods are filtered only for locally resolved files */
     if ( hc->method != METHOD_GET && hc->method != METHOD_HEAD &&
 	 hc->method != METHOD_POST && ! proxied )
