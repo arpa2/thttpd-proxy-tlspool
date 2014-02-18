@@ -225,13 +225,6 @@ extern int httpd_got_request( httpd_conn* hc );
 */
 extern int httpd_parse_request( httpd_conn* hc );
 
-/* Unparse the parsed request in hc->read_buf.  A few places were set
-** to '\0' characters to fill variables in httpd_conn, but at some point
-** this may be reversed using this function.  The variables will then be
-** unusable.
-*/
-extern void httpd_unparse_request( httpd_conn* hc );
-
 /* Starts sending data back to the client.  In some cases (directories,
 ** CGI programs), finishes sending by itself - in those cases, hc->file_fd
 ** is <0.  If there is more data to be sent, then hc->file_fd is a file
