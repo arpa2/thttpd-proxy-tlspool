@@ -3777,9 +3777,9 @@ really_start_request( httpd_conn* hc, struct timeval* nowP )
     httpd_realloc_str( &indexname, &maxindexname,
 		expnlen + 1 + strlen( hc->pathinfo ) );
     strcpy( indexname, hc->expnfilename );
-    if ( hc->pathinfo[0] != '\0' )
+    if ( ( hc->pathinfo[0] != '\0' ) || ( hc->origfilename[strlen( hc->origfilename )-1] == '/' ) )
 	{
-	indexname[expnlen] = '/';
+	strcpy( &(indexname[expnlen]), "/" );
 	strcpy( &(indexname[expnlen+1]), hc->pathinfo );
 	}
     if ( ( hc->hs->pxy_pattern != NULL )

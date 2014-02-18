@@ -129,8 +129,8 @@ The config-file option name for this flag is "cgipat",
 and the config.h option is CGI_PATTERN.
 .TP
 .B -x
-Specifies a wildcard pattern for transparent proxying, for instance "/storage/**"
-or "/proxy/*".
+Specifies a wildcard pattern for transparent proxying, for instance "*/storage/**"
+or "*/proxy/*".
 See below for details.
 The config-file option name for this flag is "pxypat",
 and the config.h option is PXY_PATTERN.
@@ -292,11 +292,14 @@ other parts of the backend server, so be as careful as always about your
 security on the backend system; you may need to constrain file visibility
 for the thttpd frontend(s) to the portion that you intend to go public.
 .PP
-Before a path is eligable for proxy treatment, it must not exist in the
-local filesystem.  The part of its name that is not matched by a trailing *
-or ** in the pxy_pattern, will be replaced with /index.pxy to find a file
-that describes how to contact the backend.  For reasons of network security,
-this file is better protected than normal files.  The file must be owned by
+The filename matched includes the virtual hostname, if this option is
+used.  Note that one proxy pattern may match all virtual hosts when the
+pattern starts with */ instead of a virtual hostname.  At the point where
+the local filesystem stops supporting the sought-for name, it will look
+for a file named index.proxy or index.pxy (in that order).  This means
+that it is possible to refine the proxy structures in subdirectories.
+For reasons of network security, the proxy description
+file is better protected than normal files.  The file must be owned by
 root, not executable by anyone and writeable only to the file owner.
 .PP
 The contents of this file comrpise of one or more lines
